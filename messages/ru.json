@@ -1,0 +1,34 @@
+{
+  "Common": {
+    "title": "FOLGA Candidate Hub",
+    "apply": "Подать заявку",
+    "dashboard": "Панель управления",
+    "candidates": "Кандидаты",
+    "documents": "Документы",
+    "settings": "Настройки",
+    "logout": "Выйти",
+    "search": "Поиск...",
+    "filter": "Фильтр",
+    "export": "Экспорт",
+    "save": "Сохранить",
+    "cancel": "Отмена",
+    "loading": "Загрузка..."
+  },
+  "CandidateForm": {
+    "title": "Анкета кандидата",
+    "personalInfo": "Личная информация",
+    "details": "Детали кандидата",
+    "documents": "Документы",
+    "firstName": "Имя",
+    "lastName": "Фамилия",
+    "email": "Email",
+    "phone": "Телефон",
+    "dob": "Дата рождения",
+    "pob": "Место рождения",
+    "citizenship": "Гражданство",
+    "submit": "Отправить заявку",
+    "success": "Заявка успешно отправлена!",
+    "next": "Далее",
+    "previous": "Назад"
+  }
+}

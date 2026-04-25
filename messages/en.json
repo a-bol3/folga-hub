@@ -1,0 +1,34 @@
+{
+  "Common": {
+    "title": "FOLGA Candidate Hub",
+    "apply": "Apply",
+    "dashboard": "Dashboard",
+    "candidates": "Candidates",
+    "documents": "Documents",
+    "settings": "Settings",
+    "logout": "Logout",
+    "search": "Search...",
+    "filter": "Filter",
+    "export": "Export",
+    "save": "Save",
+    "cancel": "Cancel",
+    "loading": "Loading..."
+  },
+  "CandidateForm": {
+    "title": "Candidate Form",
+    "personalInfo": "Personal Information",
+    "details": "Candidate Details",
+    "documents": "Documents",
+    "firstName": "First Name",
+    "lastName": "Last Name",
+    "email": "Email",
+    "phone": "Phone",
+    "dob": "Date of Birth",
+    "pob": "Place of Birth",
+    "citizenship": "Citizenship",
+    "submit": "Submit Application",
+    "success": "Application submitted successfully!",
+    "next": "Next",
+    "previous": "Previous"
+  }
+}

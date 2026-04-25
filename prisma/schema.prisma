@@ -1,0 +1,108 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  RECRUITER
+  VIEWER
+}
+
+enum CandidateStatus {
+  NEW
+  CONTACTED
+  UNDER_REVIEW
+  INTERVIEW
+  PENDING_DOCS
+  APPROVED
+  REJECTED
+  HIRED
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  role      UserRole @default(RECRUITER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  notes     Note[]
+  logs      AuditLog[]
+}
+
+model Candidate {
+  id                String          @id @default(uuid())
+  firstName         String
+  middleName        String?
+  lastName          String
+  phone             String          @unique
+  email             String          @unique
+  dateOfBirth       DateTime?
+  placeOfBirth      String?
+  countryOfBirth    String?
+  citizenship       String?
+  nationality       String?
+  sex               String?
+  maritalStatus     String?
+  education         String?
+  estimatedArrival  DateTime?
+  needsHousing      Boolean         @default(false)
+  observations      String?         @db.Text
+  status            CandidateStatus @default(NEW)
+  consentContact    Boolean         @default(false)
+  consentRecruitment Boolean        @default(false)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  documents         Document[]
+  notes             Note[]
+  history           StatusHistory[]
+}
+
+model Document {
+  id          String   @id @default(uuid())
+  candidateId String
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  type        String   // CV, Passport, etc.
+  fileName    String
+  fileUrl     String
+  fileSize    Int
+  mimeType    String
+  status      String   @default("ACTIVE")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Note {
+  id          String   @id @default(uuid())
+  candidateId String
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  content     String    @db.Text
+  createdAt   DateTime  @default(now())
+}
+
+model StatusHistory {
+  id          String          @id @default(uuid())
+  candidateId String
+  candidate   Candidate       @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  fromStatus  CandidateStatus
+  toStatus    CandidateStatus
+  changedBy   String?         // User ID or "SYSTEM"
+  createdAt   DateTime        @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  entity    String   // Candidate, Document, etc.
+  entityId  String
+  details   Json?
+  createdAt DateTime @default(now())
+}

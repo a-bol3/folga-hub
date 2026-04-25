@@ -1,0 +1,34 @@
+{
+  "Common": {
+    "title": "FOLGA Candidate Hub",
+    "apply": "Aplicar",
+    "dashboard": "Panel de Control",
+    "candidates": "Candidatos",
+    "documents": "Documentos",
+    "settings": "Ajustes",
+    "logout": "Cerrar sesión",
+    "search": "Buscar...",
+    "filter": "Filtrar",
+    "export": "Exportar",
+    "save": "Guardar",
+    "cancel": "Cancelar",
+    "loading": "Cargando..."
+  },
+  "CandidateForm": {
+    "title": "Formulario de Candidato",
+    "personalInfo": "Información Personal",
+    "details": "Detalles del Candidato",
+    "documents": "Documentos",
+    "firstName": "Nombre",
+    "lastName": "Apellido",
+    "email": "Email",
+    "phone": "Teléfono",
+    "dob": "Fecha de nacimiento",
+    "pob": "Lugar de nacimiento",
+    "citizenship": "Ciudadanía",
+    "submit": "Enviar solicitud",
+    "success": "¡Solicitud enviada con éxito!",
+    "next": "Siguiente",
+    "previous": "Anterior"
+  }
+}

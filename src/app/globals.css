@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 240 10% 3.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 240 10% 3.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 240 10% 3.9%;
+  --primary: 240 5.9% 10%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 240 4.8% 95.9%;
+  --secondary-foreground: 240 5.9% 10%;
+  --muted: 240 4.8% 95.9%;
+  --muted-foreground: 240 3.8% 46.1%;
+  --accent: 240 4.8% 95.9%;
+  --accent-foreground: 240 5.9% 10%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 240 5.9% 90%;
+  --input: 240 5.9% 90%;
+  --ring: 240 5.9% 10%;
+  --radius: 0px;
+}
+
+.dark {
+  --background: 255 45% 6%;
+  --foreground: 230 40% 95%;
+  --card: 260 40% 8%;
+  --card-foreground: 230 40% 95%;
+  --popover: 260 40% 8%;
+  --popover-foreground: 230 40% 95%;
+  --primary: 265 89% 65%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 260 50% 18%;
+  --secondary-foreground: 230 40% 95%;
+  --muted: 260 30% 12%;
+  --muted-foreground: 250 20% 75%;
+  --accent: 265 89% 65%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 350 80% 55%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 260 40% 16%;
+  --input: 260 40% 16%;
+  --ring: 265 89% 65%;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+    border-radius: 0 !important;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Enterprise Table Styling */
+.data-table {
+  @apply w-full border-collapse text-sm;
+}
+.data-table th {
+  @apply border border-border bg-muted/50 px-4 py-2 text-left font-medium;
+}
+.data-table td {
+  @apply border border-border px-4 py-2;
+}
