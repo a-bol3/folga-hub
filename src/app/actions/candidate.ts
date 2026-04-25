@@ -5,16 +5,18 @@ import { candidateSchema, type CandidateFormData } from "@/schemas/candidate";
 import { revalidatePath } from "next/cache";
 
 export async function createCandidate(data: CandidateFormData) {
-  // Validate data
   const validated = candidateSchema.safeParse(data);
+
   if (!validated.success) {
     return { success: false, error: "Invalid data" };
   }
 
-  const { email, phone } = validated.data;
+  const parsed = validated.data;
+
+  const email = parsed.email.trim().toLowerCase();
+  const phone = parsed.phone.trim();
 
   try {
-    // 1. Deduplication Logic
     const existing = await prisma.candidate.findFirst({
       where: {
         OR: [{ email }, { phone }],
@@ -22,26 +24,43 @@ export async function createCandidate(data: CandidateFormData) {
     });
 
     if (existing) {
-      // Logic: Flag as potential duplicate but allow storage (or block)
-      // Per requirements: "evitar la creación de duplicados"
-      // I will block the automatic creation if the email matches exactly for safety.
       if (existing.email === email) {
         return { success: false, error: "Email already registered" };
       }
+
+      if (existing.phone === phone) {
+        return { success: false, error: "Phone already registered" };
+      }
+
+      return { success: false, error: "Candidate already exists" };
     }
 
-    // 2. Create Candidate
-    const candidateData: any = {
-      ...validated.data,
-      dateOfBirth: validated.data.dateOfBirth ? new Date(validated.data.dateOfBirth) : null,
-      estimatedArrival: validated.data.estimatedArrival ? new Date(validated.data.estimatedArrival) : null,
-      status: "NEW",
-    };
     const candidate = await prisma.candidate.create({
-      data: candidateData,
+      data: {
+        firstName: parsed.firstName,
+        middleName: parsed.middleName || null,
+        lastName: parsed.lastName,
+        email,
+        phone,
+        dateOfBirth: parsed.dateOfBirth ? new Date(parsed.dateOfBirth) : null,
+        placeOfBirth: parsed.placeOfBirth || null,
+        countryOfBirth: parsed.countryOfBirth || null,
+        citizenship: parsed.citizenship || null,
+        nationality: parsed.nationality || null,
+        sex: parsed.sex || null,
+        maritalStatus: parsed.maritalStatus || null,
+        education: parsed.education || null,
+        estimatedArrival: parsed.estimatedArrival
+          ? new Date(parsed.estimatedArrival)
+          : null,
+        needsHousing: parsed.needsHousing ?? false,
+        observations: parsed.observations || null,
+        consentContact: parsed.consentContact ?? false,
+        consentRecruitment: parsed.consentRecruitment ?? false,
+        status: "NEW",
+      },
     });
 
-    // 3. Status History Entry
     await prisma.statusHistory.create({
       data: {
         candidateId: candidate.id,
@@ -51,31 +70,42 @@ export async function createCandidate(data: CandidateFormData) {
       },
     });
 
-    // 4. Audit Log
     await prisma.auditLog.create({
       data: {
         action: "CREATE_CANDIDATE",
         entity: "Candidate",
         entityId: candidate.id,
-        details: { email: candidate.email, source: "Public Form" },
+        details: {
+          email: candidate.email,
+          phone: candidate.phone,
+          source: "Public Form",
+        },
       },
     });
 
-    revalidatePath("/candidates");
+    revalidatePath("/[locale]/dashboard/candidates", "page");
+    revalidatePath("/[locale]/dashboard", "page");
+    revalidatePath("/", "layout");
+
     return { success: true, id: candidate.id };
   } catch (error) {
     console.error("Failed to create candidate:", error);
-    return { success: false, error: "Database error" };
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Database error",
+    };
   }
 }
 
 export async function deleteCandidate(id: string) {
   try {
-    // 1. Audit Log of deletion
-    const candidate = await prisma.candidate.findUnique({ where: { id } });
-    
+    const candidate = await prisma.candidate.findUnique({
+      where: { id },
+    });
+
     await prisma.candidate.delete({
-      where: { id }
+      where: { id },
     });
 
     if (candidate) {
@@ -84,18 +114,27 @@ export async function deleteCandidate(id: string) {
           action: "DELETE_CANDIDATE",
           entity: "Candidate",
           entityId: id,
-          details: { name: `${candidate.firstName} ${candidate.lastName}`, email: candidate.email },
+          details: {
+            name: `${candidate.firstName} ${candidate.lastName}`,
+            email: candidate.email,
+            phone: candidate.phone,
+          },
         },
       });
     }
 
     revalidatePath("/[locale]/dashboard/candidates", "page");
     revalidatePath("/[locale]/dashboard/candidates/[id]", "page");
+    revalidatePath("/[locale]/dashboard", "page");
     revalidatePath("/", "layout");
-    
+
     return { success: true };
   } catch (error) {
     console.error("Failed to delete candidate:", error);
-    return { success: false, error: error instanceof Error ? error.message : "Database error" };
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Database error",
+    };
   }
 }

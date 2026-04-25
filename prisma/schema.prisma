@@ -63,17 +63,30 @@ model Candidate {
 }
 
 model Document {
-  id          String   @id @default(uuid())
-  candidateId String
-  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
-  type        String   // CV, Passport, etc.
-  fileName    String
-  fileUrl     String
-  fileSize    Int
-  mimeType    String
-  status      String   @default("ACTIVE")
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id               String    @id @default(uuid())
+  candidateId      String
+  candidate        Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  type             String
+  fileName         String
+  fileUrl          String
+  fileSize         Int
+  mimeType         String
+  status           String    @default("ACTIVE")
+
+  documentNumber   String?
+  identityNumber   String?
+  issuingCountry   String?
+  dateOfIssue      DateTime?
+  dateOfExpiry     DateTime?
+  mrzRaw           String?   @db.Text
+  ocrText          String?   @db.Text
+  extractedJson    Json?
+  extractionStatus String    @default("PENDING")
+  confidence       Float?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 }
 
 model Note {

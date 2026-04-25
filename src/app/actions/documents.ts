@@ -3,46 +3,93 @@
 import { createClient } from "@supabase/supabase-js";
 import prisma from "@/lib/prisma";
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY! // Service role for server-side uploads
-);
+function getSupabaseAdmin() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("Missing Supabase server credentials.");
+  }
+
+  return createClient(supabaseUrl, serviceRoleKey);
+}
 
 export async function uploadCandidateDocument(
   candidateId: string,
-  file: FormData
+  formData: FormData
 ) {
-  const binary = file.get("file") as File;
-  const fileName = `${candidateId}/${Date.now()}-${binary.name}`;
+  const file = formData.get("file") as File | null;
+
+  if (!file) {
+    return {
+      success: false,
+      error: "No file received.",
+    };
+  }
+
+  const bucket = process.env.SUPABASE_STORAGE_BUCKET || "candidates";
 
   try {
-    // 1. Upload to Supabase Storage
-    const { data, error } = await supabase.storage
-      .from("candidates")
-      .upload(fileName, binary);
+    const supabase = getSupabaseAdmin();
 
-    if (error) throw error;
+    const safeFileName = file.name.replace(/[^\w.\-]/g, "_");
+    const storagePath = `${candidateId}/${Date.now()}-${safeFileName}`;
 
-    // 2. Get Public URL
-    const { data: { publicUrl } } = supabase.storage
-      .from("candidates")
-      .getPublicUrl(fileName);
+    const { error: uploadError } = await supabase.storage
+      .from(bucket)
+      .upload(storagePath, file, {
+        contentType: file.type || "application/octet-stream",
+        upsert: false,
+      });
 
-    // 3. Register in Database
+    if (uploadError) {
+      console.error("Supabase upload error:", uploadError);
+      return {
+        success: false,
+        error: "Failed to upload document to storage.",
+      };
+    }
+
+    const { data: publicData } = supabase.storage
+      .from(bucket)
+      .getPublicUrl(storagePath);
+
     const document = await prisma.document.create({
       data: {
         candidateId,
-        type: "CV", // Default for now
-        fileName: binary.name,
-        fileUrl: publicUrl,
-        fileSize: binary.size,
-        mimeType: binary.type,
+        type: "CV",
+        fileName: file.name,
+        fileUrl: publicData.publicUrl,
+        fileSize: file.size,
+        mimeType: file.type || "application/octet-stream",
+        status: "ACTIVE",
       },
     });
 
-    return { success: true, document };
+    await prisma.auditLog.create({
+      data: {
+        action: "UPLOAD_DOCUMENT",
+        entity: "Document",
+        entityId: document.id,
+        details: {
+          candidateId,
+          fileName: file.name,
+          mimeType: file.type,
+          fileSize: file.size,
+        },
+      },
+    });
+
+    return {
+      success: true,
+      document,
+    };
   } catch (error) {
-    console.error("Upload error:", error);
-    return { success: false, error: "Failed to upload document" };
+    console.error("Upload document error:", error);
+
+    return {
+      success: false,
+      error: "Unexpected upload error.",
+    };
   }
 }
