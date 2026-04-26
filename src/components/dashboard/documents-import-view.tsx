@@ -168,7 +168,7 @@ export function DocumentsImportView() {
   };
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <section className="border-2 border-dashed border-primary/50 p-6 rounded-none">
           <h2 className="font-black uppercase tracking-widest text-lg flex items-center gap-2">
@@ -261,8 +261,8 @@ export function DocumentsImportView() {
           {ocrResult && (
             <div
               className={`mt-4 border p-4 text-xs uppercase font-bold flex gap-3 ${ocrResult.success
-                  ? "text-green-500 border-green-500/30"
-                  : "text-red-500 border-red-500/30"
+                ? "text-green-500 border-green-500/30"
+                : "text-red-500 border-red-500/30"
                 }`}
             >
               {ocrResult.success ? (
