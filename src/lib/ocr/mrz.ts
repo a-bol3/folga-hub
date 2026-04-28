@@ -150,7 +150,7 @@ function extractFromPlainText(text: string): ParsedMrz | null {
     };
 
     const isOcrNoiseWord = (s: string) =>
-        /TRNEET|PASEREI|PASAPORTE|PASSPORT|REPUBLICA|COLOMBIA|COD|COUNTRY|CODE|TIPO|TYPE|PAIS|AUTORIDAD|AUTHORITY|NACIONALIDAD|FECHA|SEXO|LUGAR|BIRTH|NACIMIENTO|APELLIDOS|NOMBRES|SUMAME|SURNAME|GIVEN|HOLDER|SIGNATURE|FIRMA|VENCIMIENTO|EXPIRY|VOID|ISSUE|EXPEDICION|EMISION|COLOMBIANA/.test(s);
+        /TRNEET|PASEREI|PASAPORTE|PASSPORT|REPUBLICA|COLOMBIA|COD|COUNTRY|CODE|TIPO|TYPE|PAIS|AUTORIDAD|AUTHORITY|NACIONALIDAD|FECHA|SEXO|LUGAR|BIRTH|NACIMIENTO|APEL+IDOS|NOMBRES|SUMAME|SURNAME|GIVEN|HOLDER|SIGNATURE|FIRMA|VENCIMIENTO|EXPIRY|VOID|ISSUE|EXPEDICION|EMISION|COLOMBIANA|NAMES|NAME/.test(s);
 
     const isRealNameWord = (s: string) => {
         if (s.length < 3) return false;
@@ -171,23 +171,23 @@ function extractFromPlainText(text: string): ParsedMrz | null {
     // ── Apellidos ──────────────────────────────────────────────────────────────
     let lastName: string | undefined;
 
-    // Estrategia 1: línea SIGUIENTE a APELLIDOS/SURNAME/SUMAME
-    for (let i = 0; i < lines.length - 1; i++) {
-        if (/APELLIDOS|SURNAME|SUMAME/.test(lines[i])) {
-            if (lines[i + 1] && isRealNameLine(lines[i + 1])) {
-                lastName = lines[i + 1];
+    // Estrategia 1: línea con TRNEET/PASEREI — extraer solo palabras reales (Prioridad alta en pasaportes con ruido)
+    for (let i = 0; i < lines.length; i++) {
+        if (/TRNEET|PASEREI/.test(lines[i])) {
+            const words = lines[i].split(/\s+/).filter(isRealNameWord);
+            if (words.length >= 2) {
+                lastName = words.join(" ");
+                break;
             }
-            break;
         }
     }
 
-    // Estrategia 2: línea con TRNEET/PASEREI — extraer solo palabras reales
+    // Estrategia 2: línea SIGUIENTE a APELLIDOS/SURNAME/SUMAME
     if (!lastName) {
-        for (let i = 0; i < lines.length; i++) {
-            if (/TRNEET|PASEREI/.test(lines[i])) {
-                const words = lines[i].split(/\s+/).filter(isRealNameWord);
-                if (words.length >= 2) {
-                    lastName = words.join(" ");
+        for (let i = 0; i < lines.length - 1; i++) {
+            if (/APEL+IDOS|SURNAME|SUMAME/.test(lines[i])) {
+                if (lines[i + 1] && isRealNameLine(lines[i + 1])) {
+                    lastName = lines[i + 1];
                 }
                 break;
             }
@@ -220,14 +220,16 @@ function extractFromPlainText(text: string): ParsedMrz | null {
         }
     }
 
-    // Estrategia 2: línea después de apellidos
+    // Estrategia 2: línea después o ANTES de apellidos (algunos OCR invierten el orden)
     if (!firstName && lastName) {
         const idx = lines.findIndex((l) => l.includes(lastName.split(" ")[0]));
         if (idx !== -1) {
-            for (let j = idx + 1; j <= idx + 3; j++) {
+            // Buscar en un rango de 3 líneas alrededor
+            for (let j = idx - 3; j <= idx + 3; j++) {
+                if (j === idx) continue;
                 if (lines[j]) {
                     const cleaned = filterNameWords(lines[j]);
-                    if (cleaned && isRealNameLine(cleaned)) {
+                    if (cleaned && isRealNameLine(cleaned) && cleaned !== lastName) {
                         firstName = cleaned;
                         break;
                     }
