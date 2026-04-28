@@ -39,8 +39,8 @@ model Candidate {
   firstName         String
   middleName        String?
   lastName          String
-  phone             String          @unique
-  email             String          @unique
+  phone             String?
+  email             String?
   dateOfBirth       DateTime?
   placeOfBirth      String?
   countryOfBirth    String?

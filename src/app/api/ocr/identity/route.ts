@@ -5,12 +5,21 @@ import prisma from "@/lib/prisma";
 import { parsePassportMrz } from "@/lib/ocr/mrz";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { createCanvas, loadImage } from "canvas";
+import {
+    DocumentAnalysisClient,
+    AzureKeyCredential,
+    AnalyzeResult,
+    DocumentField,
+    AnalyzedDocument,
+} from "@azure/ai-form-recognizer";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // Disable worker in Node environment
 (pdfjsLib as any).GlobalWorkerOptions.workerSrc = "";
+
+// ---------- SUPABASE ADMIN CLIENT ----------
 
 function getSupabaseAdmin() {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -23,10 +32,21 @@ function getSupabaseAdmin() {
     return createClient(url, key);
 }
 
-/**
- * Recorta una franja inferior de la imagen (por defecto 25 % de la altura),
- * donde normalmente se encuentra la MRZ de los pasaportes.
- */
+// ---------- AZURE DOCUMENT INTELLIGENCE CLIENT ----------
+
+function getAzureClient() {
+    const endpoint = process.env.AZURE_DI_ENDPOINT;
+    const key = process.env.AZURE_DI_KEY;
+
+    if (!endpoint || !key) {
+        throw new Error("Missing Azure Document Intelligence credentials.");
+    }
+
+    return new DocumentAnalysisClient(endpoint, new AzureKeyCredential(key));
+}
+
+// ---------- HELPERS CANVAS / TESSERACT ----------
+
 function cropBottomBand(
     sourceCanvas: ReturnType<typeof createCanvas>,
     ratio: number = 0.25
@@ -34,7 +54,7 @@ function cropBottomBand(
     const width = sourceCanvas.width;
     const height = sourceCanvas.height;
 
-    const bandHeight = Math.max(Math.round(height * ratio), 40); // al menos 40px
+    const bandHeight = Math.max(Math.round(height * ratio), 40);
     const startY = height - bandHeight;
 
     const cropped = createCanvas(width, bandHeight);
@@ -55,12 +75,6 @@ function cropBottomBand(
     return cropped;
 }
 
-/**
- * Extrae texto de un PDF:
- * - intenta texto embebido;
- * - si no hay MRZ ahí, renderiza páginas como imagen,
- *   recorta franja inferior y aplica Tesseract.
- */
 async function extractTextFromPdf(buffer: Buffer): Promise<string> {
     try {
         const uint8Array = new Uint8Array(buffer);
@@ -78,7 +92,6 @@ async function extractTextFromPdf(buffer: Buffer): Promise<string> {
         for (let pageNum = 1; pageNum <= numPages; pageNum++) {
             const page = await pdf.getPage(pageNum);
 
-            // 1) rápido: texto embebido
             const textContent = await page.getTextContent();
             const embeddedText = textContent.items
                 .map((item: any) => ("str" in item ? item.str : ""))
@@ -89,7 +102,6 @@ async function extractTextFromPdf(buffer: Buffer): Promise<string> {
                 allTexts.push(embeddedText);
             }
 
-            // 2) OCR sobre franja MRZ
             const viewport = page.getViewport({ scale: 2.5 });
             const fullCanvas = createCanvas(
                 Math.round(viewport.width),
@@ -104,7 +116,7 @@ async function extractTextFromPdf(buffer: Buffer): Promise<string> {
                 })
                 .promise;
 
-            const mrzCanvas = cropBottomBand(fullCanvas, 0.25);
+            const mrzCanvas = cropBottomBand(fullCanvas, 0.35);
             const imageBuffer = mrzCanvas.toBuffer("image/png");
 
             const result = await Tesseract.recognize(imageBuffer, "eng+spa", {
@@ -123,64 +135,221 @@ async function extractTextFromPdf(buffer: Buffer): Promise<string> {
     }
 }
 
-/**
- * Extrae texto de una imagen (JPG/PNG):
- * - carga la imagen en canvas;
- * - recorta franja inferior;
- * - aplica Tesseract sobre esa franja.
- */
 async function extractTextFromImage(buffer: Buffer): Promise<string> {
     try {
         const img = await loadImage(buffer);
+        const Tesseract = await import("tesseract.js");
+
         const fullCanvas = createCanvas(img.width, img.height);
         const ctx = fullCanvas.getContext("2d");
-
-        // Dibujar imagen original
         ctx.drawImage(img, 0, 0);
+        const fullBuffer = fullCanvas.toBuffer("image/png");
 
-        // Recortar franja MRZ
-        const mrzCanvas = cropBottomBand(fullCanvas, 0.25);
-        const imageBuffer = mrzCanvas.toBuffer("image/png");
-
-        const Tesseract = await import("tesseract.js");
-        const result = await Tesseract.recognize(imageBuffer, "eng+spa", {
+        const fullResult = await Tesseract.recognize(fullBuffer, "eng", {
             logger: () => { },
         });
 
-        return result.data.text || "";
+        const mrzCanvas = cropBottomBand(fullCanvas, 0.35);
+        const mrzBuffer = mrzCanvas.toBuffer("image/png");
+
+        const mrzResult = await Tesseract.recognize(mrzBuffer, "eng", {
+            logger: () => { },
+        });
+
+        return `${fullResult.data.text || ""}\n${mrzResult.data.text || ""}`;
     } catch (error) {
         console.error("Tesseract OCR on image failed:", error);
         return "";
     }
 }
 
-/**
- * Email interno placeholder para candidatos creados por OCR.
- */
+// Reescalar imagen grande antes de enviarla a Azure
+async function resizeImageForAzure(original: Buffer): Promise<Buffer> {
+    try {
+        const img = await loadImage(original);
+        const maxDim = 2000; // px
+
+        const scale = Math.min(
+            maxDim / img.width,
+            maxDim / img.height,
+            1 // nunca escalar hacia arriba
+        );
+
+        if (scale === 1) {
+            return original;
+        }
+
+        const width = Math.round(img.width * scale);
+        const height = Math.round(img.height * scale);
+
+        const canvas = createCanvas(width, height);
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // JPEG calidad media para reducir tamaño
+        return canvas.toBuffer("image/jpeg", { quality: 0.7 });
+    } catch (error) {
+        console.error("resizeImageForAzure failed, fallback to original buffer:", error);
+        return original;
+    }
+}
+
+// ---------- HELPERS CANDIDATE PLACEHOLDERS ----------
+
 function buildCandidateEmail(parsed: {
     firstName?: string;
     lastName?: string;
     documentNumber?: string;
-}): string {
-    const parts = [
-        (parsed.firstName || "unknown").toLowerCase(),
-        (parsed.lastName || "candidate").toLowerCase(),
-        parsed.documentNumber || crypto.randomUUID().slice(0, 8),
-    ]
-        .join("-")
-        .replace(/[^a-z0-9-]+/g, "-")
-        .replace(/-{2,}/g, "-")
-        .replace(/^-|-$/g, "");
-
-    return `ocr-${parts}@folga.local`;
+}): string | null {
+    return null;
 }
 
-/**
- * Teléfono interno placeholder basado en el número de documento.
- */
-function buildCandidatePhone(documentNumber?: string): string {
-    return `DOC-${documentNumber || crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+function buildCandidatePhone(documentNumber?: string): string | null {
+    return null;
 }
+
+// ---------- AZURE MAPPING HELPERS ----------
+
+type ParsedIdentity = {
+    firstName?: string;
+    lastName?: string;
+    documentNumber?: string;
+    dateOfBirth?: string;
+    dateOfExpiry?: string;
+    issuingCountry?: string;
+    nationality?: string;
+    sex?: string;
+    mrzRaw?: string;
+    documentType?: string;
+};
+
+function getFieldValueString(field: DocumentField | undefined): string | undefined {
+    if (!field) return undefined;
+    if (field.kind === "string") return field.value;
+    if (field.kind === "countryRegion") return field.value;
+    if (field.kind === "selectionMark") return field.value;
+    return undefined;
+}
+
+function getFieldValueDate(field: DocumentField | undefined): string | undefined {
+    if (!field) return undefined;
+    if (field.kind === "date") {
+        return new Date(field.value).toISOString();
+    }
+    return undefined;
+}
+
+async function tryAzureIdDocument(
+    originalBuffer: Buffer,
+    mimeType: string
+): Promise<ParsedIdentity | null> {
+    try {
+        const client = getAzureClient();
+
+        // Si es imagen grande, la reducimos antes de enviar a Azure
+        let azureBuffer = originalBuffer;
+        if (mimeType.startsWith("image/") && originalBuffer.byteLength > 3 * 1024 * 1024) {
+            azureBuffer = await resizeImageForAzure(originalBuffer);
+        }
+
+        const poller = await client.beginAnalyzeDocument(
+            "prebuilt-idDocument",
+            azureBuffer,
+            {
+                onProgress: () => { },
+            }
+        );
+
+        const result: AnalyzeResult | undefined = await poller.pollUntilDone();
+
+        if (!result || !result.documents || result.documents.length === 0) {
+            return null;
+        }
+
+        const doc: AnalyzedDocument = result.documents[0];
+        const fields = doc.fields ?? {};
+
+        const firstName =
+            getFieldValueString(fields["firstName"]) ||
+            getFieldValueString(fields["givenName"]);
+        const lastName =
+            getFieldValueString(fields["lastName"]) ||
+            getFieldValueString(fields["surname"]) ||
+            getFieldValueString(fields["surnames"]);
+
+        const documentNumber = getFieldValueString(fields["documentNumber"]);
+        const dateOfBirth = getFieldValueDate(fields["dateOfBirth"]);
+        const dateOfExpiry = getFieldValueDate(fields["dateOfExpiration"]);
+        const issuingCountry =
+            getFieldValueString(fields["countryRegion"]) ||
+            getFieldValueString(fields["issuingCountry"]);
+        const nationality = getFieldValueString(fields["nationality"]);
+        const sex = getFieldValueString(fields["sex"]);
+        const documentType =
+            getFieldValueString(fields["documentType"]) ?? "IDENTITY_DOCUMENT";
+
+        const parsed: ParsedIdentity = {
+            firstName,
+            lastName,
+            documentNumber,
+            dateOfBirth: dateOfBirth ?? undefined,
+            dateOfExpiry: dateOfExpiry ?? undefined,
+            issuingCountry: issuingCountry ?? undefined,
+            nationality: nationality ?? undefined,
+            sex: sex ?? undefined,
+            documentType,
+        };
+
+        let mrzRaw: string | undefined;
+        const anyDoc = doc as any;
+        const content: string | undefined =
+            typeof anyDoc.content === "string" ? anyDoc.content : undefined;
+
+        if (content) {
+            const mrzCandidate = content
+                .split("\n")
+                .filter((l: string) => l.includes("<<") || l.trim().length > 40)
+                .join("\n")
+                .trim();
+            if (mrzCandidate.length > 0) {
+                mrzRaw = mrzCandidate;
+            }
+        }
+        parsed.mrzRaw = mrzRaw;
+
+        const docNumConf = fields["documentNumber"]?.confidence ?? 0;
+        const firstConf =
+            fields["firstName"]?.confidence ??
+            fields["givenName"]?.confidence ??
+            0;
+        const lastConf =
+            fields["lastName"]?.confidence ??
+            fields["surname"]?.confidence ??
+            fields["surnames"]?.confidence ??
+            0;
+
+        const confidence = docNumConf + firstConf + lastConf;
+
+        if (
+            (!parsed.firstName || !parsed.lastName) &&
+            !parsed.documentNumber &&
+            !parsed.dateOfBirth
+        ) {
+            return null;
+        }
+
+        if (confidence < 0.6) {
+            return null;
+        }
+
+        return parsed;
+    } catch (error) {
+        console.error("Azure Document Intelligence failed:", error);
+        return null;
+    }
+}
+
+// ---------- MAIN HANDLER ----------
 
 export async function POST(req: NextRequest) {
     try {
@@ -254,7 +423,16 @@ export async function POST(req: NextRequest) {
             .from(bucket)
             .getPublicUrl(storagePath);
 
-        // ===== OCR =====
+        // ===== OCR AZURE (PRIMARIO) =====
+        let parsedFromAzure: ParsedIdentity | null = null;
+        try {
+            parsedFromAzure = await tryAzureIdDocument(buffer, file.type || "");
+        } catch (e) {
+            console.error("Azure DI unexpected error:", e);
+            parsedFromAzure = null;
+        }
+
+        // ===== OCR TESSERACT + MRZ =====
         let extractedText = "";
         if (isPdf) {
             extractedText = await extractTextFromPdf(buffer);
@@ -264,7 +442,40 @@ export async function POST(req: NextRequest) {
 
         const parsedMrz = parsePassportMrz(extractedText);
 
-        if (!parsedMrz) {
+        const merged: ParsedIdentity = {
+            firstName: parsedFromAzure?.firstName || parsedMrz?.firstName,
+            lastName: parsedFromAzure?.lastName || parsedMrz?.lastName,
+            documentNumber:
+                parsedFromAzure?.documentNumber || parsedMrz?.documentNumber,
+            dateOfBirth:
+                parsedFromAzure?.dateOfBirth || parsedMrz?.dateOfBirth || undefined,
+            dateOfExpiry:
+                parsedFromAzure?.dateOfExpiry || parsedMrz?.dateOfExpiry || undefined,
+            issuingCountry:
+                parsedFromAzure?.issuingCountry || parsedMrz?.issuingCountry,
+            nationality:
+                parsedFromAzure?.nationality || parsedMrz?.nationality || undefined,
+            sex: parsedFromAzure?.sex || parsedMrz?.sex,
+            mrzRaw: parsedMrz?.mrzRaw || parsedFromAzure?.mrzRaw,
+            documentType:
+                parsedMrz?.documentType ||
+                parsedFromAzure?.documentType ||
+                "IDENTITY_DOCUMENT",
+        };
+
+        // Evaluación de fiabilidad mínima
+        const hasDocNumber =
+            !!merged.documentNumber && merged.documentNumber.trim().length >= 5;
+        const hasName =
+            !!merged.firstName &&
+            merged.firstName.trim().length >= 2 &&
+            !!merged.lastName &&
+            merged.lastName.trim().length >= 2;
+
+        const mrzOnlySafe =
+            !parsedFromAzure && parsedMrz && (hasDocNumber || hasName);
+
+        if (!hasDocNumber && !hasName && !mrzOnlySafe) {
             await prisma.auditLog.create({
                 data: {
                     action: "OCR_DOCUMENT_UPLOADED_NO_MRZ",
@@ -277,6 +488,9 @@ export async function POST(req: NextRequest) {
                         storagePath,
                         extractedTextLength: extractedText.length,
                         extractedTextPreview: extractedText.slice(0, 500),
+                        azureUsed: !!parsedFromAzure,
+                        parsedMrz,
+                        merged,
                     },
                 },
             });
@@ -286,7 +500,7 @@ export async function POST(req: NextRequest) {
                     success: false,
                     status: "OCR_REVIEW_REQUIRED",
                     error:
-                        "Document uploaded successfully, but OCR could not extract reliable MRZ data. Manual review is ready.",
+                        "Document uploaded successfully, but OCR could not extract reliable identity data. Manual review is required.",
                     file: {
                         name: file.name,
                         type: file.type,
@@ -297,6 +511,8 @@ export async function POST(req: NextRequest) {
                     debug: {
                         extractedTextLength: extractedText.length,
                         extractedTextPreview: extractedText.slice(0, 300),
+                        parsedMrz,
+                        merged,
                     },
                 },
                 { status: 422 }
@@ -304,9 +520,9 @@ export async function POST(req: NextRequest) {
         }
 
         // ===== DUPLICATES =====
-        if (parsedMrz.documentNumber) {
+        if (merged.documentNumber) {
             const duplicate = await prisma.document.findFirst({
-                where: { documentNumber: parsedMrz.documentNumber },
+                where: { documentNumber: merged.documentNumber },
                 include: { candidate: true },
             });
 
@@ -328,36 +544,37 @@ export async function POST(req: NextRequest) {
         // ===== CREATE CANDIDATE =====
         const candidate = await prisma.candidate.create({
             data: {
-                firstName: parsedMrz.firstName || "UNKNOWN",
-                lastName: parsedMrz.lastName || "UNKNOWN",
-                email: buildCandidateEmail(parsedMrz),
-                phone: buildCandidatePhone(parsedMrz.documentNumber),
-                dateOfBirth: parsedMrz.dateOfBirth
-                    ? new Date(parsedMrz.dateOfBirth)
-                    : null,
-                citizenship: parsedMrz.issuingCountry || null,
-                nationality: parsedMrz.nationality || null,
-                sex: parsedMrz.sex || null,
+                firstName: merged.firstName || "UNKNOWN",
+                lastName: merged.lastName || "UNKNOWN",
+                email: null,
+                phone: null,
+                dateOfBirth: merged.dateOfBirth ? new Date(merged.dateOfBirth) : null,
+                citizenship: merged.issuingCountry || null,
+                nationality: merged.nationality || null,
+                sex: merged.sex || null,
                 status: "NEW",
                 observations:
                     "⚠️ Candidate created from identity document OCR. Email and phone are system placeholders and must be updated with real contact data before operational use.",
                 documents: {
                     create: {
-                        type: parsedMrz.documentType || "IDENTITY_DOCUMENT",
+                        type: merged.documentType || "IDENTITY_DOCUMENT",
                         fileName: file.name,
                         fileUrl: publicUrlData.publicUrl,
                         fileSize: file.size,
                         mimeType: file.type || "application/octet-stream",
                         status: "ACTIVE",
-                        documentNumber: parsedMrz.documentNumber || null,
-                        issuingCountry: parsedMrz.issuingCountry || null,
-                        dateOfExpiry: parsedMrz.dateOfExpiry
-                            ? new Date(parsedMrz.dateOfExpiry)
+                        documentNumber: merged.documentNumber || null,
+                        issuingCountry: merged.issuingCountry || null,
+                        dateOfExpiry: merged.dateOfExpiry
+                            ? new Date(merged.dateOfExpiry)
                             : null,
                         dateOfIssue: null,
-                        mrzRaw: parsedMrz.mrzRaw || null,
+                        mrzRaw: merged.mrzRaw || null,
                         ocrText: extractedText.slice(0, 5000),
-                        extractedJson: parsedMrz as any,
+                        extractedJson: {
+                            azure: parsedFromAzure,
+                            mrz: parsedMrz,
+                        } as any,
                         extractionStatus: "EXTRACTED",
                         confidence: 0.85,
                     },
@@ -379,9 +596,10 @@ export async function POST(req: NextRequest) {
                 entityId: candidate.id,
                 details: {
                     fileName: file.name,
-                    documentNumber: parsedMrz.documentNumber,
-                    issuingCountry: parsedMrz.issuingCountry,
-                    parsedName: `${parsedMrz.firstName} ${parsedMrz.lastName}`,
+                    documentNumber: merged.documentNumber,
+                    issuingCountry: merged.issuingCountry,
+                    parsedName: `${merged.firstName || ""} ${merged.lastName || ""}`.trim(),
+                    azureUsed: !!parsedFromAzure,
                 },
             },
         });
@@ -399,8 +617,8 @@ export async function POST(req: NextRequest) {
             },
             document: {
                 url: publicUrlData.publicUrl,
-                documentNumber: parsedMrz.documentNumber,
-                mrzRaw: parsedMrz.mrzRaw,
+                documentNumber: merged.documentNumber,
+                mrzRaw: merged.mrzRaw,
             },
         });
     } catch (error) {
