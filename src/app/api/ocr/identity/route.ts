@@ -1,25 +1,29 @@
-// src/app/api/ocr/identity/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { Prisma } from "@prisma/client";
 import prisma from "@/lib/prisma";
 import { parsePassportMrz } from "@/lib/ocr/mrz";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import { createCanvas, loadImage } from "canvas";
+import { evaluateIdentityExtraction } from "@/lib/ocr/quality";
 import {
-    DocumentAnalysisClient,
-    AzureKeyCredential,
-    AnalyzeResult,
-    DocumentField,
-    AnalyzedDocument,
-} from "@azure/ai-form-recognizer";
+    mergeIdentities,
+    normalizeIdentity,
+    type NormalizedIdentity,
+} from "@/lib/ocr/normalize-identity";
+import { extractHrappkaDocumentData } from "@/lib/ocr/hrappka-document";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Disable worker in Node environment
-(pdfjsLib as any).GlobalWorkerOptions.workerSrc = "";
+type AzureField = {
+    kind?: string;
+    value?: unknown;
+    content?: string;
+    confidence?: number;
+};
 
-// ---------- SUPABASE ADMIN CLIENT ----------
+function toPrismaJson(value: unknown): Prisma.InputJsonValue {
+    return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue;
+}
 
 function getSupabaseAdmin() {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -32,9 +36,7 @@ function getSupabaseAdmin() {
     return createClient(url, key);
 }
 
-// ---------- AZURE DOCUMENT INTELLIGENCE CLIENT ----------
-
-function getAzureClient() {
+function getAzureCredentials() {
     const endpoint = process.env.AZURE_DI_ENDPOINT;
     const key = process.env.AZURE_DI_KEY;
 
@@ -42,314 +44,346 @@ function getAzureClient() {
         throw new Error("Missing Azure Document Intelligence credentials.");
     }
 
-    return new DocumentAnalysisClient(endpoint, new AzureKeyCredential(key));
+    return { endpoint, key };
 }
 
-// ---------- HELPERS CANVAS / TESSERACT ----------
+async function uploadToStorage(file: File, buffer: Buffer) {
+    const bucket = process.env.SUPABASE_STORAGE_BUCKET || "candidates";
+    const supabase = getSupabaseAdmin();
 
-function cropBottomBand(
-    sourceCanvas: ReturnType<typeof createCanvas>,
-    ratio: number = 0.25
+    const safeName = file.name
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^\w.\-]/g, "_");
+
+    const storagePath = `ocr/${Date.now()}-${safeName}`;
+
+    const { error } = await supabase.storage
+        .from(bucket)
+        .upload(storagePath, buffer, {
+            contentType: file.type || "application/octet-stream",
+            upsert: false,
+        });
+
+    if (error) {
+        throw new Error(`Storage upload failed: ${error.message}`);
+    }
+
+    const { data } = supabase.storage.from(bucket).getPublicUrl(storagePath);
+
+    return {
+        bucket,
+        storagePath,
+        publicUrl: data.publicUrl,
+    };
+}
+
+function isSupportedFile(file: File) {
+    const name = file.name.toLowerCase();
+
+    return (
+        file.type === "application/pdf" ||
+        file.type.startsWith("image/") ||
+        /\.(pdf|jpe?g|png|webp|bmp|tiff?)$/i.test(name)
+    );
+}
+
+function getField(
+    fields: Record<string, AzureField> | undefined,
+    names: string[]
 ) {
-    const width = sourceCanvas.width;
-    const height = sourceCanvas.height;
+    if (!fields) return undefined;
 
-    const bandHeight = Math.max(Math.round(height * ratio), 40);
-    const startY = height - bandHeight;
+    for (const name of names) {
+        const exact = fields[name];
+        if (exact) return exact;
 
-    const cropped = createCanvas(width, bandHeight);
-    const ctx = cropped.getContext("2d");
+        const foundKey = Object.keys(fields).find(
+            (key) => key.toLowerCase() === name.toLowerCase()
+        );
 
-    ctx.drawImage(
-        sourceCanvas,
-        0,
-        startY,
-        width,
-        bandHeight,
-        0,
-        0,
-        width,
-        bandHeight
+        if (foundKey) return fields[foundKey];
+    }
+
+    return undefined;
+}
+
+function fieldText(field?: AzureField): string | undefined {
+    if (!field) return undefined;
+
+    if (typeof field.value === "string") return field.value;
+    if (field.value instanceof Date) return field.value.toISOString().slice(0, 10);
+    if (field.value !== undefined && field.value !== null) return String(field.value);
+    if (field.content) return field.content;
+
+    return undefined;
+}
+
+function fieldDate(field?: AzureField): string | undefined {
+    if (!field) return undefined;
+
+    if (field.value instanceof Date) {
+        return field.value.toISOString().slice(0, 10);
+    }
+
+    if (typeof field.value === "string") {
+        const date = new Date(field.value);
+        if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 10);
+    }
+
+    if (field.content) {
+        const date = new Date(field.content);
+        if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 10);
+    }
+
+    return undefined;
+}
+
+function avgConfidence(fields: Array<AzureField | undefined>) {
+    const values = fields
+        .map((field) => field?.confidence)
+        .filter((value): value is number => typeof value === "number");
+
+    if (values.length === 0) return 0;
+
+    return values.reduce((sum, item) => sum + item, 0) / values.length;
+}
+
+async function analyzeWithAzureModel(buffer: Buffer, modelId: string) {
+    const { endpoint, key } = getAzureCredentials();
+    const azure = await import("@azure/ai-form-recognizer");
+
+    const client = new azure.DocumentAnalysisClient(
+        endpoint,
+        new azure.AzureKeyCredential(key)
     );
 
-    return cropped;
+    const poller = await client.beginAnalyzeDocument(modelId, buffer);
+    return poller.pollUntilDone();
 }
 
-async function extractTextFromPdf(buffer: Buffer): Promise<string> {
+async function extractWithAzureIdDocument(buffer: Buffer): Promise<{
+    identity: Partial<NormalizedIdentity> | null;
+    rawText: string;
+    raw: Prisma.InputJsonValue;
+}> {
     try {
-        const uint8Array = new Uint8Array(buffer);
-        const loadingTask = (pdfjsLib as any).getDocument({
-            data: uint8Array,
-            verbosity: 0,
+        const result: any = await analyzeWithAzureModel(buffer, "prebuilt-idDocument");
+
+        const doc = result.documents?.[0];
+        const fields = doc?.fields as Record<string, AzureField> | undefined;
+
+        const firstNameField = getField(fields, [
+            "FirstName",
+            "firstName",
+            "GivenName",
+            "givenName",
+            "First Name",
+            "Given Names",
+        ]);
+
+        const lastNameField = getField(fields, [
+            "LastName",
+            "lastName",
+            "Surname",
+            "surname",
+            "Last Name",
+            "Surnames",
+        ]);
+
+        const documentNumberField = getField(fields, [
+            "DocumentNumber",
+            "documentNumber",
+            "PassportNumber",
+            "passportNumber",
+            "Document Number",
+            "Passport No",
+        ]);
+
+        const personalNumberField = getField(fields, [
+            "PersonalNumber",
+            "personalNumber",
+            "IdentityNumber",
+            "identityNumber",
+            "IdNumber",
+            "ID Number",
+        ]);
+
+        const birthField = getField(fields, [
+            "DateOfBirth",
+            "dateOfBirth",
+            "BirthDate",
+            "Date of Birth",
+        ]);
+
+        const expiryField = getField(fields, [
+            "DateOfExpiration",
+            "dateOfExpiration",
+            "DateOfExpiry",
+            "dateOfExpiry",
+            "ExpiryDate",
+            "Date of Expiry",
+        ]);
+
+        const issueField = getField(fields, [
+            "DateOfIssue",
+            "dateOfIssue",
+            "IssueDate",
+            "Date of Issue",
+        ]);
+
+        const countryField = getField(fields, [
+            "CountryRegion",
+            "countryRegion",
+            "IssuingCountry",
+            "issuingCountry",
+            "Country",
+        ]);
+
+        const nationalityField = getField(fields, ["Nationality", "nationality"]);
+        const sexField = getField(fields, ["Sex", "sex", "Gender", "gender"]);
+
+        const placeOfBirthField = getField(fields, [
+            "PlaceOfBirth",
+            "placeOfBirth",
+            "BirthPlace",
+        ]);
+
+        const confidence = avgConfidence([
+            firstNameField,
+            lastNameField,
+            documentNumberField,
+            birthField,
+            expiryField,
+        ]);
+
+        const identity = normalizeIdentity({
+            documentType: "IDENTITY_DOCUMENT",
+            firstName: fieldText(firstNameField),
+            lastName: fieldText(lastNameField),
+            documentNumber: fieldText(documentNumberField),
+            identityNumber: fieldText(personalNumberField),
+            dateOfBirth: fieldDate(birthField),
+            dateOfIssue: fieldDate(issueField),
+            dateOfExpiry: fieldDate(expiryField),
+            issuingCountry: fieldText(countryField),
+            nationality: fieldText(nationalityField),
+            sex: fieldText(sexField),
+            placeOfBirth: fieldText(placeOfBirthField),
+            confidence,
+            source: "AZURE",
         });
-        const pdf = await loadingTask.promise;
 
-        const numPages = Math.min(pdf.numPages, 3);
-        const allTexts: string[] = [];
-
-        const Tesseract = await import("tesseract.js");
-
-        for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-            const page = await pdf.getPage(pageNum);
-
-            const textContent = await page.getTextContent();
-            const embeddedText = textContent.items
-                .map((item: any) => ("str" in item ? item.str : ""))
-                .join(" ")
-                .trim();
-
-            if (embeddedText.length > 20) {
-                allTexts.push(embeddedText);
-            }
-
-            const viewport = page.getViewport({ scale: 2.5 });
-            const fullCanvas = createCanvas(
-                Math.round(viewport.width),
-                Math.round(viewport.height)
-            );
-            const ctx = fullCanvas.getContext("2d");
-
-            await page
-                .render({
-                    canvasContext: ctx as any,
-                    viewport,
-                })
-                .promise;
-
-            const mrzCanvas = cropBottomBand(fullCanvas, 0.35);
-            const imageBuffer = mrzCanvas.toBuffer("image/png");
-
-            const result = await Tesseract.recognize(imageBuffer, "eng+spa", {
-                logger: () => { },
-            });
-
-            if (result.data.text) {
-                allTexts.push(result.data.text);
-            }
-        }
-
-        return allTexts.join("\n");
-    } catch (error) {
-        console.error("PDF render + OCR failed:", error);
-        return "";
-    }
-}
-
-async function extractTextFromImage(buffer: Buffer): Promise<string> {
-    try {
-        const img = await loadImage(buffer);
-        const Tesseract = await import("tesseract.js");
-
-        const fullCanvas = createCanvas(img.width, img.height);
-        const ctx = fullCanvas.getContext("2d");
-        ctx.drawImage(img, 0, 0);
-        const fullBuffer = fullCanvas.toBuffer("image/png");
-
-        const fullResult = await Tesseract.recognize(fullBuffer, "eng", {
-            logger: () => { },
-        });
-
-        const mrzCanvas = cropBottomBand(fullCanvas, 0.35);
-        const mrzBuffer = mrzCanvas.toBuffer("image/png");
-
-        const mrzResult = await Tesseract.recognize(mrzBuffer, "eng", {
-            logger: () => { },
-        });
-
-        return `${fullResult.data.text || ""}\n${mrzResult.data.text || ""}`;
-    } catch (error) {
-        console.error("Tesseract OCR on image failed:", error);
-        return "";
-    }
-}
-
-// Reescalar imagen grande antes de enviarla a Azure
-async function resizeImageForAzure(original: Buffer): Promise<Buffer> {
-    try {
-        const img = await loadImage(original);
-        const maxDim = 2000; // px
-
-        const scale = Math.min(
-            maxDim / img.width,
-            maxDim / img.height,
-            1 // nunca escalar hacia arriba
-        );
-
-        if (scale === 1) {
-            return original;
-        }
-
-        const width = Math.round(img.width * scale);
-        const height = Math.round(img.height * scale);
-
-        const canvas = createCanvas(width, height);
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, width, height);
-
-        // JPEG calidad media para reducir tamaño
-        return canvas.toBuffer("image/jpeg", { quality: 0.7 });
-    } catch (error) {
-        console.error("resizeImageForAzure failed, fallback to original buffer:", error);
-        return original;
-    }
-}
-
-// ---------- HELPERS CANDIDATE PLACEHOLDERS ----------
-
-function buildCandidateEmail(parsed: {
-    firstName?: string;
-    lastName?: string;
-    documentNumber?: string;
-}): string | null {
-    return null;
-}
-
-function buildCandidatePhone(documentNumber?: string): string | null {
-    return null;
-}
-
-// ---------- AZURE MAPPING HELPERS ----------
-
-type ParsedIdentity = {
-    firstName?: string;
-    lastName?: string;
-    documentNumber?: string;
-    dateOfBirth?: string;
-    dateOfExpiry?: string;
-    issuingCountry?: string;
-    nationality?: string;
-    sex?: string;
-    mrzRaw?: string;
-    documentType?: string;
-};
-
-function getFieldValueString(field: DocumentField | undefined): string | undefined {
-    if (!field) return undefined;
-    if (field.kind === "string") return field.value;
-    if (field.kind === "countryRegion") return field.value;
-    if (field.kind === "selectionMark") return field.value;
-    return undefined;
-}
-
-function getFieldValueDate(field: DocumentField | undefined): string | undefined {
-    if (!field) return undefined;
-    if (field.kind === "date") {
-        return new Date(field.value).toISOString();
-    }
-    return undefined;
-}
-
-async function tryAzureIdDocument(
-    originalBuffer: Buffer,
-    mimeType: string
-): Promise<ParsedIdentity | null> {
-    try {
-        const client = getAzureClient();
-
-        // Si es imagen grande, la reducimos antes de enviar a Azure
-        let azureBuffer = originalBuffer;
-        if (mimeType.startsWith("image/") && originalBuffer.byteLength > 3 * 1024 * 1024) {
-            azureBuffer = await resizeImageForAzure(originalBuffer);
-        }
-
-        const poller = await client.beginAnalyzeDocument(
-            "prebuilt-idDocument",
-            azureBuffer,
-            {
-                onProgress: () => { },
-            }
-        );
-
-        const result: AnalyzeResult | undefined = await poller.pollUntilDone();
-
-        if (!result || !result.documents || result.documents.length === 0) {
-            return null;
-        }
-
-        const doc: AnalyzedDocument = result.documents[0];
-        const fields = doc.fields ?? {};
-
-        const firstName =
-            getFieldValueString(fields["firstName"]) ||
-            getFieldValueString(fields["givenName"]);
-        const lastName =
-            getFieldValueString(fields["lastName"]) ||
-            getFieldValueString(fields["surname"]) ||
-            getFieldValueString(fields["surnames"]);
-
-        const documentNumber = getFieldValueString(fields["documentNumber"]);
-        const dateOfBirth = getFieldValueDate(fields["dateOfBirth"]);
-        const dateOfExpiry = getFieldValueDate(fields["dateOfExpiration"]);
-        const issuingCountry =
-            getFieldValueString(fields["countryRegion"]) ||
-            getFieldValueString(fields["issuingCountry"]);
-        const nationality = getFieldValueString(fields["nationality"]);
-        const sex = getFieldValueString(fields["sex"]);
-        const documentType =
-            getFieldValueString(fields["documentType"]) ?? "IDENTITY_DOCUMENT";
-
-        const parsed: ParsedIdentity = {
-            firstName,
-            lastName,
-            documentNumber,
-            dateOfBirth: dateOfBirth ?? undefined,
-            dateOfExpiry: dateOfExpiry ?? undefined,
-            issuingCountry: issuingCountry ?? undefined,
-            nationality: nationality ?? undefined,
-            sex: sex ?? undefined,
-            documentType,
+        return {
+            identity:
+                identity.firstName ||
+                    identity.lastName ||
+                    identity.documentNumber ||
+                    identity.dateOfBirth
+                    ? identity
+                    : null,
+            rawText: result.content || "",
+            raw: toPrismaJson({
+                fields,
+                content: result.content,
+            }),
         };
-
-        let mrzRaw: string | undefined;
-        const anyDoc = doc as any;
-        const content: string | undefined =
-            typeof anyDoc.content === "string" ? anyDoc.content : undefined;
-
-        if (content) {
-            const mrzCandidate = content
-                .split("\n")
-                .filter((l: string) => l.includes("<<") || l.trim().length > 40)
-                .join("\n")
-                .trim();
-            if (mrzCandidate.length > 0) {
-                mrzRaw = mrzCandidate;
-            }
-        }
-        parsed.mrzRaw = mrzRaw;
-
-        const docNumConf = fields["documentNumber"]?.confidence ?? 0;
-        const firstConf =
-            fields["firstName"]?.confidence ??
-            fields["givenName"]?.confidence ??
-            0;
-        const lastConf =
-            fields["lastName"]?.confidence ??
-            fields["surname"]?.confidence ??
-            fields["surnames"]?.confidence ??
-            0;
-
-        const confidence = docNumConf + firstConf + lastConf;
-
-        if (
-            (!parsed.firstName || !parsed.lastName) &&
-            !parsed.documentNumber &&
-            !parsed.dateOfBirth
-        ) {
-            return null;
-        }
-
-        if (confidence < 0.6) {
-            return null;
-        }
-
-        return parsed;
     } catch (error) {
-        console.error("Azure Document Intelligence failed:", error);
-        return null;
+        console.error("Azure prebuilt-idDocument failed:", error);
+
+        return {
+            identity: null,
+            rawText: "",
+            raw: toPrismaJson({
+                error: error instanceof Error ? error.message : "Unknown Azure ID error",
+            }),
+        };
     }
 }
 
-// ---------- MAIN HANDLER ----------
+async function extractWithAzureRead(buffer: Buffer): Promise<{
+    text: string;
+    raw: Prisma.InputJsonValue;
+}> {
+    try {
+        const result: any = await analyzeWithAzureModel(buffer, "prebuilt-read");
+
+        return {
+            text: result.content || "",
+            raw: toPrismaJson({
+                content: result.content,
+                pages: result.pages,
+            }),
+        };
+    } catch (error) {
+        console.error("Azure prebuilt-read failed:", error);
+
+        return {
+            text: "",
+            raw: toPrismaJson({
+                error: error instanceof Error ? error.message : "Unknown Azure Read error",
+            }),
+        };
+    }
+}
+
+async function extractWithLocalTesseract(buffer: Buffer) {
+    try {
+        const Tesseract = await import("tesseract.js");
+
+        const result = await Tesseract.recognize(buffer, "eng+spa+pol", {
+            logger: () => { },
+        });
+
+        return result.data.text || "";
+    } catch (error) {
+        console.error("Local Tesseract fallback failed:", error);
+        return "";
+    }
+}
+
+async function createReviewAudit(args: {
+    file: File;
+    fileUrl: string;
+    storagePath: string;
+    extractedText: string;
+    extractedData: unknown;
+    reasons: string[];
+    azureIdRaw: Prisma.InputJsonValue;
+    azureReadRaw: Prisma.InputJsonValue | null;
+}) {
+    await prisma.auditLog.create({
+        data: {
+            action: "OCR_REVIEW_REQUIRED",
+            entity: "Document",
+            entityId: "OCR_PENDING",
+            details: toPrismaJson({
+                fileName: args.file.name,
+                fileSize: args.file.size,
+                mimeType: args.file.type,
+                fileUrl: args.fileUrl,
+                storagePath: args.storagePath,
+                extractedTextPreview: args.extractedText.slice(0, 1500),
+                extractedData: args.extractedData,
+                reasons: args.reasons,
+                azureIdRaw: args.azureIdRaw,
+                azureReadRaw: args.azureReadRaw,
+            }),
+        },
+    });
+}
+
+function canAutoCreateCandidate(extractedData: ReturnType<typeof extractHrappkaDocumentData>) {
+    const hasName = Boolean(extractedData.firstName && extractedData.lastName);
+    const hasIdentifier = Boolean(
+        extractedData.documentNumber ||
+        extractedData.identityNumber ||
+        extractedData.pesel ||
+        extractedData.permitNumber
+    );
+
+    return hasName && hasIdentifier && extractedData.confidence >= 0.85;
+}
 
 export async function POST(req: NextRequest) {
     try {
@@ -363,7 +397,18 @@ export async function POST(req: NextRequest) {
             );
         }
 
+        if (!isSupportedFile(file)) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    error: "Unsupported file type. Upload PDF, JPG, PNG, WEBP, BMP, TIFF.",
+                },
+                { status: 415 }
+            );
+        }
+
         const maxSize = 15 * 1024 * 1024;
+
         if (file.size > maxSize) {
             return NextResponse.json(
                 {
@@ -374,125 +419,80 @@ export async function POST(req: NextRequest) {
             );
         }
 
-        const isPdf =
-            file.type === "application/pdf" ||
-            file.name.toLowerCase().endsWith(".pdf");
-        const isImage =
-            file.type.startsWith("image/") ||
-            /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(file.name);
-
-        if (!isPdf && !isImage) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    error:
-                        "Unsupported file type. Please upload a PDF, JPG or PNG identity document.",
-                },
-                { status: 415 }
-            );
-        }
-
         const buffer = Buffer.from(await file.arrayBuffer());
-        const bucket = process.env.SUPABASE_STORAGE_BUCKET || "candidates";
-        const supabase = getSupabaseAdmin();
+        const uploaded = await uploadToStorage(file, buffer);
 
-        const safeName = file.name
-            .normalize("NFD")
-            .replace(/[\u0300-\u036f]/g, "")
-            .replace(/[^\w.\-]/g, "_");
-        const storagePath = `ocr/${Date.now()}-${safeName}`;
+        const azureId = await extractWithAzureIdDocument(buffer);
+        const azureRead = await extractWithAzureRead(buffer);
 
-        const { error: uploadError } = await supabase.storage
-            .from(bucket)
-            .upload(storagePath, buffer, {
-                contentType: file.type || "application/octet-stream",
-                upsert: false,
+        const localText =
+            azureRead.text.length > 20 ? "" : await extractWithLocalTesseract(buffer);
+
+        const combinedText = [azureId.rawText, azureRead.text, localText]
+            .filter(Boolean)
+            .join("\n");
+
+        const mrzIdentity = parsePassportMrz(combinedText);
+
+        const mergedIdentity = mergeIdentities(azureId.identity, mrzIdentity);
+        const extractedData = extractHrappkaDocumentData(combinedText, mergedIdentity);
+
+        const quality = evaluateIdentityExtraction({
+            firstName: extractedData.firstName,
+            lastName: extractedData.lastName,
+            documentNumber:
+                extractedData.documentNumber ||
+                extractedData.identityNumber ||
+                extractedData.pesel ||
+                extractedData.permitNumber,
+            dateOfBirth: extractedData.dateOfBirth,
+            mrzRaw: extractedData.mrzRaw,
+            confidence: extractedData.confidence,
+        });
+
+        const dedupeNumber =
+            extractedData.documentNumber ||
+            extractedData.identityNumber ||
+            extractedData.pesel ||
+            extractedData.permitNumber;
+
+        if (dedupeNumber) {
+            const duplicateDocument = await prisma.document.findFirst({
+                where: {
+                    OR: [
+                        { documentNumber: dedupeNumber },
+                        { identityNumber: dedupeNumber },
+                    ],
+                },
+                include: { candidate: true },
             });
 
-        if (uploadError) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    error: `Storage upload failed: ${uploadError.message}`,
-                },
-                { status: 500 }
-            );
-        }
-
-        const { data: publicUrlData } = supabase.storage
-            .from(bucket)
-            .getPublicUrl(storagePath);
-
-        // ===== OCR AZURE (PRIMARIO) =====
-        let parsedFromAzure: ParsedIdentity | null = null;
-        try {
-            parsedFromAzure = await tryAzureIdDocument(buffer, file.type || "");
-        } catch (e) {
-            console.error("Azure DI unexpected error:", e);
-            parsedFromAzure = null;
-        }
-
-        // ===== OCR TESSERACT + MRZ =====
-        let extractedText = "";
-        if (isPdf) {
-            extractedText = await extractTextFromPdf(buffer);
-        } else {
-            extractedText = await extractTextFromImage(buffer);
-        }
-
-        const parsedMrz = parsePassportMrz(extractedText);
-
-        const merged: ParsedIdentity = {
-            firstName: parsedFromAzure?.firstName || parsedMrz?.firstName,
-            lastName: parsedFromAzure?.lastName || parsedMrz?.lastName,
-            documentNumber:
-                parsedFromAzure?.documentNumber || parsedMrz?.documentNumber,
-            dateOfBirth:
-                parsedFromAzure?.dateOfBirth || parsedMrz?.dateOfBirth || undefined,
-            dateOfExpiry:
-                parsedFromAzure?.dateOfExpiry || parsedMrz?.dateOfExpiry || undefined,
-            issuingCountry:
-                parsedFromAzure?.issuingCountry || parsedMrz?.issuingCountry,
-            nationality:
-                parsedFromAzure?.nationality || parsedMrz?.nationality || undefined,
-            sex: parsedFromAzure?.sex || parsedMrz?.sex,
-            mrzRaw: parsedMrz?.mrzRaw || parsedFromAzure?.mrzRaw,
-            documentType:
-                parsedMrz?.documentType ||
-                parsedFromAzure?.documentType ||
-                "IDENTITY_DOCUMENT",
-        };
-
-        // Evaluación de fiabilidad mínima
-        const hasDocNumber =
-            !!merged.documentNumber && merged.documentNumber.trim().length >= 5;
-        const hasName =
-            !!merged.firstName &&
-            merged.firstName.trim().length >= 2 &&
-            !!merged.lastName &&
-            merged.lastName.trim().length >= 2;
-
-        const mrzOnlySafe =
-            !parsedFromAzure && parsedMrz && (hasDocNumber || hasName);
-
-        if (!hasDocNumber && !hasName && !mrzOnlySafe) {
-            await prisma.auditLog.create({
-                data: {
-                    action: "OCR_DOCUMENT_UPLOADED_NO_MRZ",
-                    entity: "Document",
-                    entityId: "OCR_PENDING",
-                    details: {
-                        fileName: file.name,
-                        fileSize: file.size,
-                        mimeType: file.type,
-                        storagePath,
-                        extractedTextLength: extractedText.length,
-                        extractedTextPreview: extractedText.slice(0, 500),
-                        azureUsed: !!parsedFromAzure,
-                        parsedMrz,
-                        merged,
+            if (duplicateDocument) {
+                return NextResponse.json(
+                    {
+                        success: false,
+                        status: "DUPLICATE_DOCUMENT",
+                        error: `This document already exists for candidate: ${duplicateDocument.candidate.firstName} ${duplicateDocument.candidate.lastName}`,
+                        candidateId: duplicateDocument.candidateId,
+                        documentId: duplicateDocument.id,
+                        fileUrl: duplicateDocument.fileUrl,
+                        extracted: extractedData,
                     },
-                },
+                    { status: 409 }
+                );
+            }
+        }
+
+        if (!canAutoCreateCandidate(extractedData)) {
+            await createReviewAudit({
+                file,
+                fileUrl: uploaded.publicUrl,
+                storagePath: uploaded.storagePath,
+                extractedText: combinedText,
+                extractedData,
+                reasons: quality.reasons,
+                azureIdRaw: azureId.raw,
+                azureReadRaw: azureRead.raw,
             });
 
             return NextResponse.json(
@@ -500,90 +500,88 @@ export async function POST(req: NextRequest) {
                     success: false,
                     status: "OCR_REVIEW_REQUIRED",
                     error:
-                        "Document uploaded successfully, but OCR could not extract reliable identity data. Manual review is required.",
+                        "Document uploaded successfully, but OCR result requires manual review.",
+                    reasons: quality.reasons,
                     file: {
                         name: file.name,
                         type: file.type,
                         size: file.size,
-                        url: publicUrlData.publicUrl,
-                        storagePath,
+                        url: uploaded.publicUrl,
+                        storagePath: uploaded.storagePath,
                     },
+                    extracted: extractedData,
+                    extractedTextPreview: combinedText.slice(0, 1500),
                     debug: {
-                        extractedTextLength: extractedText.length,
-                        extractedTextPreview: extractedText.slice(0, 300),
-                        parsedMrz,
-                        merged,
+                        azureIdIdentity: azureId.identity,
+                        azureIdRaw: azureId.raw,
+                        azureReadRaw: azureRead.raw,
+                        mrzIdentity,
+                        mergedIdentity,
+                        extractedData,
+                        quality,
                     },
                 },
                 { status: 422 }
             );
         }
 
-        // ===== DUPLICATES =====
-        if (merged.documentNumber) {
-            const duplicate = await prisma.document.findFirst({
-                where: { documentNumber: merged.documentNumber },
-                include: { candidate: true },
-            });
-
-            if (duplicate) {
-                return NextResponse.json(
-                    {
-                        success: false,
-                        status: "DUPLICATE_DOCUMENT",
-                        error: `This document already exists for candidate: ${duplicate.candidate.firstName} ${duplicate.candidate.lastName}`,
-                        candidateId: duplicate.candidateId,
-                        documentId: duplicate.id,
-                        fileUrl: duplicate.fileUrl,
-                    },
-                    { status: 409 }
-                );
-            }
-        }
-
-        // ===== CREATE CANDIDATE =====
         const candidate = await prisma.candidate.create({
             data: {
-                firstName: merged.firstName || "UNKNOWN",
-                lastName: merged.lastName || "UNKNOWN",
+                firstName: extractedData.firstName!,
+                lastName: extractedData.lastName!,
                 email: null,
                 phone: null,
-                dateOfBirth: merged.dateOfBirth ? new Date(merged.dateOfBirth) : null,
-                citizenship: merged.issuingCountry || null,
-                nationality: merged.nationality || null,
-                sex: merged.sex || null,
+                dateOfBirth: extractedData.dateOfBirth
+                    ? new Date(extractedData.dateOfBirth)
+                    : null,
+                placeOfBirth: extractedData.placeOfBirth || null,
+                citizenship: extractedData.issuingCountry || null,
+                nationality: extractedData.nationality || null,
+                sex: extractedData.sex || null,
                 status: "NEW",
                 observations:
-                    "⚠️ Candidate created from identity document OCR. Email and phone are system placeholders and must be updated with real contact data before operational use.",
+                    "Candidate created from Azure-first HRappka document OCR. Contact data must be completed manually.",
                 documents: {
                     create: {
-                        type: merged.documentType || "IDENTITY_DOCUMENT",
+                        type: extractedData.detectedDocumentType || extractedData.documentType,
                         fileName: file.name,
-                        fileUrl: publicUrlData.publicUrl,
+                        fileUrl: uploaded.publicUrl,
                         fileSize: file.size,
                         mimeType: file.type || "application/octet-stream",
                         status: "ACTIVE",
-                        documentNumber: merged.documentNumber || null,
-                        issuingCountry: merged.issuingCountry || null,
-                        dateOfExpiry: merged.dateOfExpiry
-                            ? new Date(merged.dateOfExpiry)
+                        documentNumber:
+                            extractedData.documentNumber ||
+                            extractedData.permitNumber ||
+                            extractedData.decisionNumber ||
+                            null,
+                        identityNumber:
+                            extractedData.identityNumber || extractedData.pesel || null,
+                        issuingCountry: extractedData.issuingCountry || null,
+                        dateOfIssue: extractedData.dateOfIssue
+                            ? new Date(extractedData.dateOfIssue)
                             : null,
-                        dateOfIssue: null,
-                        mrzRaw: merged.mrzRaw || null,
-                        ocrText: extractedText.slice(0, 5000),
-                        extractedJson: {
-                            azure: parsedFromAzure,
-                            mrz: parsedMrz,
-                        } as any,
+                        dateOfExpiry:
+                            extractedData.dateOfExpiry || extractedData.dateOfPermitExpiry
+                                ? new Date(extractedData.dateOfExpiry || extractedData.dateOfPermitExpiry!)
+                                : null,
+                        mrzRaw: extractedData.mrzRaw || null,
+                        ocrText: combinedText.slice(0, 5000),
+                        extractedJson: toPrismaJson({
+                            extractedData,
+                            azureId: azureId.raw,
+                            azureRead: azureRead.raw,
+                            mrz: mrzIdentity,
+                            quality,
+                        }),
                         extractionStatus: "EXTRACTED",
-                        confidence: 0.85,
+                        confidence: extractedData.confidence,
                     },
                 },
                 history: {
                     create: {
                         fromStatus: "NEW",
                         toStatus: "NEW",
-                        changedBy: "SYSTEM_OCR",
+                        changedBy: "SYSTEM_OCR_AZURE",
                     },
                 },
             },
@@ -591,16 +589,15 @@ export async function POST(req: NextRequest) {
 
         await prisma.auditLog.create({
             data: {
-                action: "OCR_CREATE_CANDIDATE",
+                action: "OCR_CREATE_CANDIDATE_AZURE_FIRST",
                 entity: "Candidate",
                 entityId: candidate.id,
-                details: {
+                details: toPrismaJson({
                     fileName: file.name,
-                    documentNumber: merged.documentNumber,
-                    issuingCountry: merged.issuingCountry,
-                    parsedName: `${merged.firstName || ""} ${merged.lastName || ""}`.trim(),
-                    azureUsed: !!parsedFromAzure,
-                },
+                    fileUrl: uploaded.publicUrl,
+                    extractedData,
+                    confidence: extractedData.confidence,
+                }),
             },
         });
 
@@ -608,18 +605,8 @@ export async function POST(req: NextRequest) {
             success: true,
             candidateId: candidate.id,
             message: `Candidate created: ${candidate.firstName} ${candidate.lastName}`,
-            candidate: {
-                id: candidate.id,
-                firstName: candidate.firstName,
-                lastName: candidate.lastName,
-                email: candidate.email,
-                phone: candidate.phone,
-            },
-            document: {
-                url: publicUrlData.publicUrl,
-                documentNumber: merged.documentNumber,
-                mrzRaw: merged.mrzRaw,
-            },
+            extracted: extractedData,
+            fileUrl: uploaded.publicUrl,
         });
     } catch (error) {
         console.error("OCR identity route error:", error);

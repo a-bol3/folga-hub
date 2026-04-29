@@ -17,8 +17,58 @@ type ReviewFile = {
   size: number;
   url: string;
   storagePath?: string;
-  extractedTextPreview?: string;
 };
+
+type ManualForm = {
+  firstName: string;
+  middleName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  dateOfBirth: string;
+  placeOfBirth: string;
+  countryOfBirth: string;
+  citizenship: string;
+  nationality: string;
+  sex: string;
+  documentType: string;
+  documentNumber: string;
+  identityNumber: string;
+  issuingCountry: string;
+  dateOfIssue: string;
+  dateOfExpiry: string;
+  mrzRaw: string;
+  observations: string;
+};
+
+const initialManualForm: ManualForm = {
+  firstName: "",
+  middleName: "",
+  lastName: "",
+  email: "",
+  phone: "",
+  dateOfBirth: "",
+  placeOfBirth: "",
+  countryOfBirth: "",
+  citizenship: "",
+  nationality: "",
+  sex: "",
+  documentType: "PASSPORT",
+  documentNumber: "",
+  identityNumber: "",
+  issuingCountry: "",
+  dateOfIssue: "",
+  dateOfExpiry: "",
+  mrzRaw: "",
+  observations: "",
+};
+
+function formatDate(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toISOString().slice(0, 10);
+}
 
 export function DocumentsImportView() {
   const [isUploading, setIsUploading] = useState(false);
@@ -26,28 +76,36 @@ export function DocumentsImportView() {
   const [result, setResult] = useState<any>(null);
   const [ocrResult, setOcrResult] = useState<any>(null);
   const [reviewFile, setReviewFile] = useState<ReviewFile | null>(null);
-  const [manualForm, setManualForm] = useState({
-    firstName: "",
-    middleName: "",
-    lastName: "",
-    email: "",
-    phone: "",
-    dateOfBirth: "",
-    placeOfBirth: "",
-    citizenship: "",
-    nationality: "",
-    sex: "",
-    documentType: "PASSPORT",
-    documentNumber: "",
-    identityNumber: "",
-    issuingCountry: "",
-    dateOfIssue: "",
-    dateOfExpiry: "",
-    observations: "",
-  });
+  const [extractedTextPreview, setExtractedTextPreview] = useState("");
+  const [extractedJson, setExtractedJson] = useState<any>(null);
+  const [manualForm, setManualForm] =
+    useState<ManualForm>(initialManualForm);
 
-  const updateManual = (key: string, value: string) => {
+  const updateManual = (key: keyof ManualForm, value: string) => {
     setManualForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const prefillManualForm = (extracted: any) => {
+    if (!extracted) return;
+
+    setManualForm((prev) => ({
+      ...prev,
+      firstName: extracted.firstName || "",
+      lastName: extracted.lastName || "",
+      dateOfBirth: formatDate(extracted.dateOfBirth),
+      nationality: extracted.nationality || "",
+      citizenship: extracted.issuingCountry || "",
+      sex: extracted.sex || "",
+      documentType: extracted.documentType || "PASSPORT",
+      documentNumber: extracted.documentNumber || "",
+      identityNumber: extracted.identityNumber || "",
+      issuingCountry: extracted.issuingCountry || "",
+      dateOfIssue: formatDate(extracted.dateOfIssue),
+      dateOfExpiry: formatDate(extracted.dateOfExpiry),
+      mrzRaw: extracted.mrzRaw || "",
+      observations:
+        "Candidate created after manual review of OCR extraction.",
+    }));
   };
 
   const handleExcelFile = async (file: File) => {
@@ -57,11 +115,17 @@ export function DocumentsImportView() {
     try {
       const formData = new FormData();
       formData.append("file", file);
+
       const response = await importCandidatesFromExcel(formData);
 
       setResult({
         success: response.success,
         msg: response.msg || response.error,
+      });
+    } catch (error) {
+      setResult({
+        success: false,
+        msg: error instanceof Error ? error.message : "Import failed.",
       });
     } finally {
       setIsUploading(false);
@@ -72,6 +136,9 @@ export function DocumentsImportView() {
     setIsOcrProcessing(true);
     setOcrResult(null);
     setReviewFile(null);
+    setExtractedTextPreview("");
+    setExtractedJson(null);
+    setManualForm(initialManualForm);
 
     try {
       const formData = new FormData();
@@ -91,20 +158,24 @@ export function DocumentsImportView() {
           candidateId: response.candidateId,
         });
       } else if (response.status === "OCR_REVIEW_REQUIRED" && response.file) {
-        setReviewFile({
-          ...response.file,
-          extractedTextPreview: response.extractedTextPreview || "",
-        });
+        setReviewFile(response.file);
+        setExtractedTextPreview(response.extractedTextPreview || "");
+        setExtractedJson(response.extracted || null);
+        prefillManualForm(response.extracted);
 
         setOcrResult({
           success: false,
           review: true,
-          msg: "OCR could not extract reliable data. Manual review is ready.",
+          msg:
+            response.error ||
+            "OCR requires manual review before candidate creation.",
+          reasons: response.reasons || [],
         });
       } else {
         setOcrResult({
           success: false,
           msg: response.error || "OCR failed.",
+          candidateId: response.candidateId,
         });
       }
     } catch (error) {
@@ -133,7 +204,8 @@ export function DocumentsImportView() {
           fileUrl: reviewFile.url,
           fileSize: reviewFile.size,
           mimeType: reviewFile.type,
-          ocrText: reviewFile.extractedTextPreview,
+          ocrText: extractedTextPreview,
+          extractedJson,
         }),
       });
 
@@ -145,7 +217,9 @@ export function DocumentsImportView() {
           msg: response.message,
           candidateId: response.candidateId,
         });
+
         setReviewFile(null);
+        setManualForm(initialManualForm);
       } else {
         setOcrResult({
           success: false,
@@ -153,6 +227,14 @@ export function DocumentsImportView() {
           candidateId: response.candidateId,
         });
       }
+    } catch (error) {
+      setOcrResult({
+        success: false,
+        msg:
+          error instanceof Error
+            ? error.message
+            : "Manual review failed.",
+      });
     } finally {
       setIsOcrProcessing(false);
     }
@@ -163,9 +245,31 @@ export function DocumentsImportView() {
     handler: (file: File) => Promise<void>
   ) => {
     event.preventDefault();
+    event.stopPropagation();
+
     const file = event.dataTransfer.files?.[0];
     if (file) handler(file);
   };
+
+  const manualFields: Array<[keyof ManualForm, string, string]> = [
+    ["firstName", "First name", "text"],
+    ["middleName", "Middle name", "text"],
+    ["lastName", "Last name", "text"],
+    ["email", "Email", "email"],
+    ["phone", "Phone", "text"],
+    ["dateOfBirth", "Date of birth", "date"],
+    ["placeOfBirth", "Place of birth", "text"],
+    ["countryOfBirth", "Country of birth", "text"],
+    ["citizenship", "Citizenship", "text"],
+    ["nationality", "Nationality", "text"],
+    ["sex", "Sex", "text"],
+    ["documentType", "Document type", "text"],
+    ["documentNumber", "Document number", "text"],
+    ["identityNumber", "Identity number", "text"],
+    ["issuingCountry", "Issuing country", "text"],
+    ["dateOfIssue", "Date of issue", "date"],
+    ["dateOfExpiry", "Date of expiry", "date"],
+  ];
 
   return (
     <div className="space-y-6">
@@ -191,12 +295,14 @@ export function DocumentsImportView() {
             ) : (
               <Upload className="w-10 h-10 mb-3" />
             )}
+
             <span className="text-xs font-black uppercase">
               Click para buscar o arrastrar Excel
             </span>
             <span className="text-xs text-muted-foreground mt-2">
               .XLSX, .XLS, .CSV
             </span>
+
             <input
               id="excel-file"
               type="file"
@@ -211,7 +317,7 @@ export function DocumentsImportView() {
           </label>
 
           {result && (
-            <div className="mt-4 border p-4 text-xs uppercase font-bold">
+            <div className="mt-4 border p-4 text-xs uppercase font-bold rounded-none">
               {result.msg}
             </div>
           )}
@@ -224,8 +330,8 @@ export function DocumentsImportView() {
           </h2>
 
           <p className="text-sm text-muted-foreground mt-2">
-            Karta Pobytu, Pasaportes y PESEL. Creación automática mediante
-            OCR/manual review.
+            Pasaportes, karta pobytu y documentos PESEL con revisión manual
+            defensiva.
           </p>
 
           <label
@@ -239,17 +345,19 @@ export function DocumentsImportView() {
             ) : (
               <Upload className="w-10 h-10 mb-3" />
             )}
+
             <span className="text-xs font-black uppercase">
               Click para capturar
             </span>
             <span className="text-xs text-muted-foreground mt-2">
-              .PDF, .JPG, .PNG
+              .PDF, .JPG, .PNG, .WEBP
             </span>
+
             <input
               id="ocr-file"
               type="file"
               className="hidden"
-              accept=".pdf,.jpg,.jpeg,.png"
+              accept=".pdf,.jpg,.jpeg,.png,.webp"
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 if (file) handleOcrFile(file);
@@ -260,9 +368,9 @@ export function DocumentsImportView() {
 
           {ocrResult && (
             <div
-              className={`mt-4 border p-4 text-xs uppercase font-bold flex gap-3 ${ocrResult.success
-                ? "text-green-500 border-green-500/30"
-                : "text-red-500 border-red-500/30"
+              className={`mt-4 border p-4 text-xs uppercase font-bold flex gap-3 rounded-none ${ocrResult.success
+                  ? "text-green-500 border-green-500/30"
+                  : "text-red-500 border-red-500/30"
                 }`}
             >
               {ocrResult.success ? (
@@ -270,8 +378,18 @@ export function DocumentsImportView() {
               ) : (
                 <AlertCircle className="h-4 w-4" />
               )}
+
               <div>
                 <p>{ocrResult.msg}</p>
+
+                {ocrResult.reasons?.length > 0 && (
+                  <ul className="mt-2 list-disc pl-4">
+                    {ocrResult.reasons.map((reason: string) => (
+                      <li key={reason}>{reason}</li>
+                    ))}
+                  </ul>
+                )}
+
                 {ocrResult.candidateId && (
                   <a
                     href={`/es/dashboard/candidates/${ocrResult.candidateId}`}
@@ -288,14 +406,14 @@ export function DocumentsImportView() {
 
       {reviewFile && (
         <section className="border-2 border-amber-500/40 p-6 rounded-none">
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <h2 className="font-black uppercase tracking-widest">
                 Manual Document Review
               </h2>
               <p className="text-sm text-muted-foreground mt-1">
-                OCR failed, but the document was uploaded. Fill the fields below
-                to create the candidate.
+                OCR could not create the candidate safely. Review the uploaded
+                document and confirm the fields below.
               </p>
             </div>
 
@@ -303,7 +421,7 @@ export function DocumentsImportView() {
               href={reviewFile.url}
               target="_blank"
               rel="noreferrer"
-              className="border px-4 py-2 text-xs font-black uppercase flex items-center gap-2"
+              className="border px-4 py-2 text-xs font-black uppercase flex items-center gap-2 rounded-none"
             >
               <ExternalLink className="h-4 w-4" />
               Open File
@@ -311,38 +429,30 @@ export function DocumentsImportView() {
           </div>
 
           <div className="grid md:grid-cols-3 gap-4 mt-6">
-            {[
-              ["firstName", "First name"],
-              ["middleName", "Middle name"],
-              ["lastName", "Last name"],
-              ["email", "Email"],
-              ["phone", "Phone"],
-              ["dateOfBirth", "Date of birth"],
-              ["placeOfBirth", "Place of birth"],
-              ["citizenship", "Citizenship"],
-              ["nationality", "Nationality"],
-              ["sex", "Sex"],
-              ["documentType", "Document type"],
-              ["documentNumber", "Document number"],
-              ["identityNumber", "Identity number"],
-              ["issuingCountry", "Issuing country"],
-              ["dateOfIssue", "Date of issue"],
-              ["dateOfExpiry", "Date of expiry"],
-            ].map(([key, label]) => (
+            {manualFields.map(([key, label, type]) => (
               <div key={key} className="space-y-2">
                 <label className="text-[10px] font-black uppercase text-muted-foreground">
                   {label}
                 </label>
                 <input
-                  type={
-                    key.toLowerCase().includes("date") ? "date" : "text"
-                  }
-                  value={(manualForm as any)[key]}
+                  type={type}
+                  value={manualForm[key]}
                   onChange={(e) => updateManual(key, e.target.value)}
                   className="w-full border bg-background px-3 py-2 text-sm rounded-none"
                 />
               </div>
             ))}
+          </div>
+
+          <div className="mt-4 space-y-2">
+            <label className="text-[10px] font-black uppercase text-muted-foreground">
+              MRZ Raw
+            </label>
+            <textarea
+              value={manualForm.mrzRaw}
+              onChange={(e) => updateManual("mrzRaw", e.target.value)}
+              className="w-full border bg-background px-3 py-2 text-sm h-20 rounded-none font-mono"
+            />
           </div>
 
           <div className="mt-4 space-y-2">
@@ -356,12 +466,25 @@ export function DocumentsImportView() {
             />
           </div>
 
+          {extractedTextPreview && (
+            <details className="mt-4 border p-4 rounded-none">
+              <summary className="text-xs font-black uppercase cursor-pointer">
+                OCR Raw Text Preview
+              </summary>
+              <pre className="mt-4 text-xs whitespace-pre-wrap opacity-70">
+                {extractedTextPreview}
+              </pre>
+            </details>
+          )}
+
           <button
             onClick={submitManualReview}
             disabled={isOcrProcessing}
             className="mt-6 border px-6 py-3 text-xs font-black uppercase rounded-none"
           >
-            {isOcrProcessing ? "Saving..." : "Create Candidate From Document"}
+            {isOcrProcessing
+              ? "Saving..."
+              : "Create Candidate From Reviewed Document"}
           </button>
         </section>
       )}

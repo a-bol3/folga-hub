@@ -4,29 +4,53 @@ import prisma from "@/lib/prisma";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function required(value: unknown) {
-    return typeof value === "string" && value.trim().length > 0;
+function clean(value: unknown): string | null {
+    if (value === null || value === undefined) return null;
+    const text = String(value).replace(/\s+/g, " ").trim();
+    return text.length > 0 ? text : null;
+}
+
+function cleanUpper(value: unknown): string | null {
+    const text = clean(value);
+    return text ? text.toUpperCase() : null;
+}
+
+function parseDate(value: unknown): Date | null {
+    const text = clean(value);
+    if (!text) return null;
+
+    const date = new Date(text);
+    return Number.isNaN(date.getTime()) ? null : date;
 }
 
 export async function POST(req: NextRequest) {
     try {
         const body = await req.json();
 
-        if (!required(body.firstName) || !required(body.lastName)) {
+        const firstName = cleanUpper(body.firstName);
+        const lastName = cleanUpper(body.lastName);
+
+        if (!firstName || !lastName) {
             return NextResponse.json(
                 { success: false, error: "First name and last name are required." },
                 { status: 400 }
             );
         }
 
-        if (!required(body.fileUrl) || !required(body.fileName)) {
+        const fileName = clean(body.fileName);
+        const fileUrl = clean(body.fileUrl);
+
+        if (!fileName || !fileUrl) {
             return NextResponse.json(
                 { success: false, error: "Document file data is missing." },
                 { status: 400 }
             );
         }
 
-        const documentNumber = body.documentNumber?.trim() || null;
+        const documentNumber = cleanUpper(body.documentNumber);
+        const identityNumber = cleanUpper(body.identityNumber);
+        const email = clean(body.email)?.toLowerCase() || null;
+        const phone = clean(body.phone);
 
         if (documentNumber) {
             const existingDocument = await prisma.document.findFirst({
@@ -46,62 +70,60 @@ export async function POST(req: NextRequest) {
             }
         }
 
-        const email =
-            body.email?.trim().toLowerCase() ||
-            `manual-${crypto.randomUUID()}@folga.local`;
-
-        const phone =
-            body.phone?.trim() ||
-            (documentNumber ? `DOC-${documentNumber}` : `DOC-${crypto.randomUUID()}`);
-
-        const existingCandidate = await prisma.candidate.findFirst({
-            where: {
-                OR: [{ email }, { phone }],
-            },
-        });
-
-        if (existingCandidate) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    error: `Candidate already exists: ${existingCandidate.firstName} ${existingCandidate.lastName}.`,
-                    candidateId: existingCandidate.id,
+        if (email || phone) {
+            const existingCandidate = await prisma.candidate.findFirst({
+                where: {
+                    OR: [
+                        ...(email ? [{ email }] : []),
+                        ...(phone ? [{ phone }] : []),
+                    ],
                 },
-                { status: 409 }
-            );
+            });
+
+            if (existingCandidate) {
+                return NextResponse.json(
+                    {
+                        success: false,
+                        error: `Candidate already exists: ${existingCandidate.firstName} ${existingCandidate.lastName}.`,
+                        candidateId: existingCandidate.id,
+                    },
+                    { status: 409 }
+                );
+            }
         }
 
         const candidate = await prisma.candidate.create({
             data: {
-                firstName: body.firstName.trim(),
-                middleName: body.middleName?.trim() || null,
-                lastName: body.lastName.trim(),
+                firstName,
+                middleName: cleanUpper(body.middleName),
+                lastName,
                 email,
                 phone,
-                dateOfBirth: body.dateOfBirth ? new Date(body.dateOfBirth) : null,
-                placeOfBirth: body.placeOfBirth?.trim() || null,
-                citizenship: body.citizenship?.trim() || null,
-                nationality: body.nationality?.trim() || null,
-                sex: body.sex?.trim() || null,
+                dateOfBirth: parseDate(body.dateOfBirth),
+                placeOfBirth: cleanUpper(body.placeOfBirth),
+                countryOfBirth: cleanUpper(body.countryOfBirth),
+                citizenship: cleanUpper(body.citizenship),
+                nationality: cleanUpper(body.nationality),
+                sex: cleanUpper(body.sex),
                 status: "NEW",
                 observations:
-                    body.observations?.trim() ||
-                    "Candidate created from manual identity document review.",
+                    clean(body.observations) ||
+                    "Candidate created from manual review of identity document.",
                 documents: {
                     create: {
-                        type: body.documentType || "IDENTITY_DOCUMENT",
-                        fileName: body.fileName,
-                        fileUrl: body.fileUrl,
+                        type: cleanUpper(body.documentType) || "IDENTITY_DOCUMENT",
+                        fileName,
+                        fileUrl,
                         fileSize: Number(body.fileSize || 0),
-                        mimeType: body.mimeType || "application/octet-stream",
+                        mimeType: clean(body.mimeType) || "application/octet-stream",
                         status: "ACTIVE",
                         documentNumber,
-                        identityNumber: body.identityNumber?.trim() || null,
-                        issuingCountry: body.issuingCountry?.trim() || null,
-                        dateOfIssue: body.dateOfIssue ? new Date(body.dateOfIssue) : null,
-                        dateOfExpiry: body.dateOfExpiry ? new Date(body.dateOfExpiry) : null,
-                        mrzRaw: body.mrzRaw?.trim() || null,
-                        ocrText: body.ocrText?.trim() || null,
+                        identityNumber,
+                        issuingCountry: cleanUpper(body.issuingCountry),
+                        dateOfIssue: parseDate(body.dateOfIssue),
+                        dateOfExpiry: parseDate(body.dateOfExpiry),
+                        mrzRaw: clean(body.mrzRaw),
+                        ocrText: clean(body.ocrText),
                         extractedJson: body.extractedJson || null,
                         extractionStatus: "MANUAL_REVIEWED",
                         confidence: 1,
@@ -123,8 +145,9 @@ export async function POST(req: NextRequest) {
                 entity: "Candidate",
                 entityId: candidate.id,
                 details: {
-                    fileName: body.fileName,
+                    fileName,
                     documentNumber,
+                    identityNumber,
                     source: "manual-review",
                 },
             },
